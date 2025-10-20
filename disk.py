@@ -78,14 +78,23 @@ class DSS_Disk:
     def handle_command_client(self, client_socket, address):
         """Handle P2P commands from users or other disks"""
         try:
-            while True:
-                message = Message.receive_message(client_socket)
-                if not message:
-                    break
-                
-                command, args = Message.decode_message(message.encode())
-                print(f"Disk {self.disk_name} received: {command} {args}")
-                
+            message = Message.receive_message(client_socket)
+            if not message:
+                return
+            
+            command, args = Message.decode_message(message.encode())
+            print(f"Disk {self.disk_name} received: {command} {args}")
+            
+            # Handle store-block specially (needs to receive data)
+            if command == "store-block":
+                response = self.store_block(args, client_socket)
+                if response:  # Only send if not None
+                    Message.send_message(client_socket, response)
+            elif command == "read-block":
+                response = self.read_block(args, client_socket)
+                if response:  # Only send if not None
+                    Message.send_message(client_socket, response)
+            else:
                 response = self.process_command(command, args)
                 Message.send_message(client_socket, response)
                 
@@ -96,23 +105,45 @@ class DSS_Disk:
     
     def process_command(self, command, args):
         """Process P2P commands"""
+        if command == "fail":
+            return self.simulate_failure()
+        
         if self.failed:
-            return "FAIL"
+            return "DISK-FAILED"
         
         with self.lock:
-            if command == "store-block":
-                return self.store_block(args)
-            elif command == "read-block":
-                return self.read_block(args)
-            elif command == "fail":
-                return self.simulate_failure()
+            if command == "delete-all":
+                return self.delete_all_for_dss(args)
             elif command == "get-stripe":
                 return self.get_stripe(args)
             else:
                 return FAILURE
+            
+    def simulate_failure(self):
+        """Simulate disk failure by deleting all contents"""
+        print(f"\n!!! DISK FAILURE SIMULATION !!!")
+        print(f"Disk {self.disk_name} is failing...")
+        
+        try:
+            # Delete all files in storage directory
+            deleted_count = 0
+            for filename in os.listdir(self.storage_dir):
+                file_path = os.path.join(self.storage_dir, filename)
+                os.remove(file_path)
+                deleted_count += 1
+            
+            self.failed = True
+            print(f"Deleted {deleted_count} files")
+            print(f"Disk {self.disk_name} has FAILED!")
+            
+            return "FAIL-COMPLETE"
+        except Exception as e:
+            print(f"Error during failure simulation: {e}")
+            return FAILURE
+
     
-    def store_block(self, args):
-        """Store a data or parity block"""
+    def store_block(self, args, client_socket):
+        """Store a data or parity block - receives actual data"""
         if len(args) < 5:
             return FAILURE
         
@@ -120,10 +151,13 @@ class DSS_Disk:
         stripe_num = int(stripe_num)
         data_size = int(data_size)
         
-        if block_type == "data":
-            block_data = b'D' * data_size  # Dummy data block
-        else:  # parity
-            block_data = b'P' * data_size  # Dummy parity block
+        # Receive the actual block data from client
+        block_data = b''
+        while len(block_data) < data_size:
+            chunk = client_socket.recv(min(4096, data_size - len(block_data)))
+            if not chunk:
+                return FAILURE
+            block_data += chunk
         
         # Store the block
         file_path = os.path.join(self.storage_dir, f"{dss_name}_{file_name}")
@@ -146,12 +180,13 @@ class DSS_Disk:
         with open(file_path, 'wb') as f:
             f.write(json.dumps(file_data).encode())
         
-        print(f"Stored {block_type} block for stripe {stripe_num} of {file_name}")
+        print(f"Stored {block_type} block for stripe {stripe_num} of {file_name} ({data_size} bytes)")
         return SUCCESS
     
-    def read_block(self, args):
-        """Read a data or parity block"""
+    def read_block(self, args, client_socket):
+        """Read a data or parity block and send actual data"""
         if len(args) < 3:
+            print("read-block: insufficient arguments")
             return FAILURE
         
         dss_name, file_name, stripe_num = args[:3]
@@ -159,7 +194,10 @@ class DSS_Disk:
         
         file_path = os.path.join(self.storage_dir, f"{dss_name}_{file_name}")
         
+        print(f"Reading from {file_path}, stripe {stripe_num}")
+        
         if not os.path.exists(file_path):
+            print(f"File not found: {file_path}")
             return FAILURE
         
         try:
@@ -168,17 +206,27 @@ class DSS_Disk:
             
             stripe_key = str(stripe_num)
             if stripe_key not in file_data['stripes']:
+                print(f"Stripe {stripe_num} not found in file")
+                print(f"Available stripes: {list(file_data['stripes'].keys())}")
                 return FAILURE
             
             stripe_data = file_data['stripes'][stripe_key]
             block_data = bytes.fromhex(stripe_data['data'])
             
-            # In a real implementation, you'd send the actual data
-            # For now, return success with data size
-            return f"{SUCCESS} {stripe_data['size']} {stripe_data['type']}"
+            # Send success response with metadata
+            response = f"{SUCCESS} {stripe_data['size']} {stripe_data['type']}"
+            Message.send_message(client_socket, response)
+            
+            # Send the actual block data
+            client_socket.sendall(block_data)
+            
+            print(f"Sent {stripe_data['type']} block for stripe {stripe_num} ({len(block_data)} bytes)")
+            return None  # Already sent response, don't send again
             
         except Exception as e:
             print(f"Error reading block: {e}")
+            import traceback
+            traceback.print_exc()
             return FAILURE
     
     def get_stripe(self, args):
@@ -209,11 +257,6 @@ class DSS_Disk:
             print(f"Error getting stripe: {e}")
             return FAILURE
     
-    def simulate_failure(self):
-        """Simulate disk failure"""
-        self.failed = True
-        print(f"Disk {self.disk_name} has failed!")
-        return "FAIL-COMPLETE"
     
     def recover_stripe(self, dss_name, file_name, stripe_num, other_disk_info):
         """Recover a stripe from other disks using XOR parity"""
@@ -267,6 +310,20 @@ class DSS_Disk:
         except Exception as e:
             print(f"Error deregistering with manager: {e}")
             return False
+    def delete_all_for_dss(self, dss_name):
+        """Delete all files for a specific DSS"""
+        try:
+            # Find all files belonging to this DSS
+            for filename in os.listdir(self.storage_dir):
+                if filename.startswith(f"{dss_name}_"):
+                    file_path = os.path.join(self.storage_dir, filename)
+                    os.remove(file_path)
+                    print(f"Deleted {filename}")
+            
+            return SUCCESS
+        except Exception as e:
+            print(f"Error deleting files: {e}")
+            return FAILURE
 
 def main():
     if len(sys.argv) != 6:

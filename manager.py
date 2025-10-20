@@ -81,6 +81,8 @@ class DSS_Manager:
                 return self.disk_failure(args)
             elif command == "decommission-dss":
                 return self.decommission_dss(args)
+            elif command == "decommission-complete":
+                return self.decommission_complete(args)
             elif command == "deregister-user":
                 return self.deregister_user(args)
             elif command == "deregister-disk":
@@ -277,14 +279,7 @@ class DSS_Manager:
         dss_name = list(self.dss_configs.keys())[0]
         config = self.dss_configs[dss_name]
         
-        # Store file metadata
-        if dss_name not in self.files:
-            self.files[dss_name] = {}
-        
-        self.files[dss_name][file_name] = {
-            'size': file_size,
-            'owner': owner
-        }
+        # DON'T store file metadata yet - wait for copy-complete
         
         # Return DSS parameters
         response_parts = [SUCCESS, dss_name, str(file_size), str(config['n']), 
@@ -302,35 +297,56 @@ class DSS_Manager:
         
         
     def copy_complete(self, args):
-        """Handle copy completion"""
-        if len(args) != 3:
+        """Handle copy completion - NOW add file to directory"""
+        if len(args) != 4:  # dss_name, file_name, owner, file_size
+            print(f"Copy-complete requires 4 args, got {len(args)}: {args}")
             return FAILURE
         
-        dss_name, file_name, owner = args
-        
-        return SUCCESS
-    
-    def read_file(self, args):
-        """Initiate file read from DSS"""
-        if len(args) != 3:
-            return FAILURE
-        
-        dss_name, file_name, user_name = args
+        dss_name, file_name, owner, file_size = args
         
         if dss_name not in self.dss_configs:
             print(f"DSS {dss_name} not found")
             return FAILURE
         
+        # Add file to DSS directory NOW
+        if dss_name not in self.files:
+            self.files[dss_name] = {}
+        
+        self.files[dss_name][file_name] = {
+            'size': int(file_size),
+            'owner': owner
+        }
+        
+        print(f"Copy completed for {file_name} ({file_size} bytes) on {dss_name} by {owner}")
+        return SUCCESS
+    
+    def read_file(self, args):
+        """Initiate file read from DSS"""
+        if len(args) != 3:
+            print(f"Read command requires 3 args, got {len(args)}: {args}")
+            return FAILURE
+        
+        dss_name, file_name, user_name = args
+        
+        # Check if DSS exists
+        if dss_name not in self.dss_configs:
+            print(f"DSS {dss_name} not found")
+            return FAILURE
+        
+        # Check if file exists in DSS
         if dss_name not in self.files or file_name not in self.files[dss_name]:
             print(f"File {file_name} not found in DSS {dss_name}")
+            print(f"Available files in {dss_name}: {list(self.files.get(dss_name, {}).keys())}")
             return FAILURE
         
         file_info = self.files[dss_name][file_name]
-        config = self.dss_configs[dss_name]
         
+        # Check ownership
         if file_info['owner'] != user_name:
             print(f"Access denied: {user_name} does not own {file_name} (owned by {file_info['owner']})")
-            return "FAILURE ownership"
+            return FAILURE
+        
+        config = self.dss_configs[dss_name]
         
         # Return DSS and file parameters
         response_parts = [SUCCESS, str(file_info['size']), str(config['n']), 
@@ -343,7 +359,7 @@ class DSS_Manager:
                 disk_name, disk_info['address'], str(disk_info['c_port'])
             ])
         
-        print(f"Read operation initiated for {file_name} from {dss_name}")
+        print(f"Read operation initiated for {file_name} from {dss_name} by {user_name}")
         return " ".join(response_parts)
     
     def read_complete(self, args):
@@ -351,24 +367,76 @@ class DSS_Manager:
         return SUCCESS
     
     def disk_failure(self, args):
-        """Handle disk failure simulation"""
+        """Handle disk failure simulation - Phase 1: Return DSS info"""
         if len(args) != 1:
             return FAILURE
         
         dss_name = args[0]
         
         if dss_name not in self.dss_configs:
+            print(f"DSS {dss_name} not found")
             return FAILURE
         
-        # Implementation details would go here
-        return SUCCESS
-    
+        # if dss_name in self.read_operations and self.read_operations[dss_name]:
+        #     print(f"DSS {dss_name} has ongoing read operations")
+        #     return FAILURE
+        
+        config = self.dss_configs[dss_name]
+        
+        # Return DSS parameters for failure and recovery
+        response_parts = [SUCCESS, str(config['n']), str(config['striping_unit']), 
+                        str(len(config['disk_order']))]
+        
+        # Add disk information
+        for disk_name in config['disk_order']:
+            disk_info = self.disks[disk_name]
+            response_parts.extend([
+                disk_name, disk_info['address'], str(disk_info['c_port'])
+            ])
+        
+        print(f"Disk failure initiated for DSS {dss_name}")
+        return " ".join(response_parts)
+
     def recovery_complete(self, args):
-        """Handle recovery completion"""
+        """Handle recovery completion - Phase 2"""
+        if len(args) < 2:
+            return FAILURE
+        
+        dss_name = args[0]
+        failed_disk_name = args[1]
+        
+        print(f"Recovery completed for disk {failed_disk_name} in DSS {dss_name}")
         return SUCCESS
     
     def decommission_dss(self, args):
-        """Decommission a DSS"""
+        """Decommission a DSS - Phase 1: Return DSS info"""
+        if len(args) != 1:
+            return FAILURE
+        
+        dss_name = args[0]
+        
+        if dss_name not in self.dss_configs:
+            print(f"DSS {dss_name} not found")
+            return FAILURE
+        
+        config = self.dss_configs[dss_name]
+        
+        # Return DSS parameters so user can instruct disks to delete content
+        response_parts = [SUCCESS, str(config['n']), str(config['striping_unit']), 
+                        str(len(config['disk_order']))]
+        
+        # Add disk information
+        for disk_name in config['disk_order']:
+            disk_info = self.disks[disk_name]
+            response_parts.extend([
+                disk_name, disk_info['address'], str(disk_info['c_port'])
+            ])
+        
+        print(f"Decommission initiated for DSS {dss_name}")
+        return " ".join(response_parts)
+
+    def decommission_complete(self, args):
+        """Decommission a DSS - Phase 2: Clean up after user confirms deletion"""
         if len(args) != 1:
             return FAILURE
         
@@ -377,17 +445,20 @@ class DSS_Manager:
         if dss_name not in self.dss_configs:
             return FAILURE
         
-        # Set all disks in this DSS back to Free
         config = self.dss_configs[dss_name]
+        
+        # Set all disks in this DSS back to Free
         for disk_name in config['disk_order']:
             if disk_name in self.disks:
                 self.disks[disk_name]['state'] = 'Free'
+                print(f"Disk {disk_name} set to Free")
         
         # Remove DSS configuration
         del self.dss_configs[dss_name]
         if dss_name in self.files:
             del self.files[dss_name]
         
+        print(f"✓ DSS {dss_name} decommissioned")
         return SUCCESS
     
     def deregister_user(self, args):
